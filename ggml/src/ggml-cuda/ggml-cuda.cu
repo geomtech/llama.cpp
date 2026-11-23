@@ -1034,6 +1034,8 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_q6k_shadow_release(ctx->dev_ptr, ggml_backend_buffer_get_size(buffer));
     delete ctx;
 }
 

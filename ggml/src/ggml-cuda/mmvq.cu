@@ -1180,6 +1180,730 @@ static void mul_mat_vec_q_moe_launch(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Pascal-optimised Q4_K x Q8_1 matvec (ncols_dst == 1): native ggml layout, 128-bit weight loads,
+// one warp per R rows, activations staged once per block in shared memory, optional fused gate/GLU.
+// ---------------------------------------------------------------------------------------------
+template <int W, int R, bool GATE>
+static __global__ void __launch_bounds__(W * 32)
+mul_mat_vec_q4_K_pascal(
+        const uint8_t * __restrict__ vx, const uint8_t * __restrict__ vgate, const int * __restrict__ y,
+        float * __restrict__ dst, const float * __restrict__ x_bias, const float * __restrict__ gate_bias,
+        const ggml_glu_op glu_op, const float glu_limit, const int ncols) {
+    constexpr int NG = GATE ? 2 : 1;
+    extern __shared__ int q4k_ys[];
+    const int nsb  = ncols >> 8;
+    const int nint = (ncols >> 5) * 9;
+    ggml_cuda_pdl_sync();
+    for (int i = threadIdx.x + threadIdx.y * 32; i < nint; i += W * 32) {
+        q4k_ys[i] = y[i];
+    }
+    __syncthreads();
+
+    const int  lane = threadIdx.x, warp = threadIdx.y;
+    const int  l8 = lane & 7, sbl = lane >> 3;
+    const int  g = l8 >> 1, h = l8 & 1;
+    const bool hiScale = g >= 2;
+    const int  row0 = (blockIdx.x * W + warp) * R;
+    const size_t rowBytes = (size_t) nsb * 144;
+
+    float acc[NG][R];
+#pragma unroll
+    for (int t = 0; t < NG; ++t) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) acc[t][r] = 0.f;
+    }
+
+    for (int sb = sbl; sb < nsb; sb += 4) {
+        uint4 hd[NG][R], qq[NG][R];
+#pragma unroll
+        for (int t = 0; t < NG; ++t) {
+            const uint8_t * base = t == 0 ? vx : vgate;
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const uint4 * blk = (const uint4 *) (base + (size_t) (row0 + r) * rowBytes + (size_t) sb * 144);
+                hd[t][r] = __ldg(blk);
+                qq[t][r] = __ldg(blk + 1 + l8);
+            }
+        }
+        const int * ylo = q4k_ys + (sb * 8 + 2 * g) * 9;
+        const int * yhi = ylo + 9;
+        const int dlo = ylo[0], dhi = yhi[0];
+        const float2 flo = __half22float2(*(const half2 *) &dlo);
+        const float2 fhi = __half22float2(*(const half2 *) &dhi);
+        int alo[4], ahi[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { alo[i] = ylo[1 + 4 * h + i]; ahi[i] = yhi[1 + 4 * h + i]; }
+
+#pragma unroll
+        for (int t = 0; t < NG; ++t) {
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float2   dd  = __half22float2(*(const half2 *) &hd[t][r].x);
+                const uint64_t lo8 = ((uint64_t) hd[t][r].z << 32) | hd[t][r].y;
+                const uint32_t w2  = hd[t][r].w;
+                uint32_t sc[2], mn[2];
+#pragma unroll
+                for (int k = 0; k < 2; ++k) {
+                    const int      j  = 2 * g + k, jj = j & 3;
+                    const uint32_t bj = (uint32_t) (lo8 >> (8 * j)) & 0xFF;
+                    const uint32_t bm = (uint32_t) (lo8 >> (8 * (j + 4))) & 0xFF;
+                    const uint32_t bl = (uint32_t) (lo8 >> (8 * jj)) & 0xFF;
+                    const uint32_t b2 = (w2 >> (8 * jj)) & 0xFF;
+                    const uint32_t scA = bj & 63, mA = bm & 63;
+                    const uint32_t scB = (b2 & 0xF) | ((bl >> 6) << 4), mB = (b2 >> 4) | ((bj >> 6) << 4);
+                    sc[k] = hiScale ? scB : scA;
+                    mn[k] = hiScale ? mB : mA;
+                }
+                const uint32_t qv[4] = {qq[t][r].x, qq[t][r].y, qq[t][r].z, qq[t][r].w};
+                int dl = 0, dh = 0;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    dl = ggml_cuda_dp4a((int) (qv[i] & 0x0F0F0F0Fu), alo[i], dl);
+                    dh = ggml_cuda_dp4a((int) ((qv[i] >> 4) & 0x0F0F0F0Fu), ahi[i], dh);
+                }
+                float v = dd.x * (flo.x * (float) ((int) sc[0] * dl) + fhi.x * (float) ((int) sc[1] * dh));
+                if (h == 0) v -= dd.y * (flo.y * (float) mn[0] + fhi.y * (float) mn[1]);
+                acc[t][r] += v;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int t = 0; t < NG; ++t) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            float v = acc[t][r];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            acc[t][r] = v;
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int row = row0 + r;
+            float result = acc[0][r];
+            if (x_bias) result += x_bias[row];
+            if constexpr (GATE) {
+                float gv = acc[1][r];
+                if (gate_bias) gv += gate_bias[row];
+                switch (glu_op) {
+                    case GGML_GLU_OP_SWIGLU:       result *= ggml_cuda_op_silu_single(gv); break;
+                    case GGML_GLU_OP_GEGLU:        result *= ggml_cuda_op_gelu_single(gv); break;
+                    case GGML_GLU_OP_SWIGLU_OAI:   result = ggml_cuda_op_swiglu_oai_single(gv, result); break;
+                    case GGML_GLU_OP_SWIGLU_CLAMP: result = ggml_cuda_op_swiglu_clamp_single(gv, result, glu_limit); break;
+                    default:                       result = result * gv; break;
+                }
+            }
+            dst[row] = result;
+        }
+    }
+}
+
+// Returns true when the Pascal Q4_K fast path handled the call.
+static bool mul_mat_vec_q4_K_pascal_try(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_row_x,
+        const int nchannels_dst, const int nsamples_dst, cudaStream_t stream) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_Q4K_PASCAL"); return !e || atoi(e) != 0; }();
+    if (!enabled || ids || ncols_dst != 1 || nchannels_dst != 1 || nsamples_dst != 1) return false;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!(GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA)) return false;
+    if (ncols_x % 256 != 0 || stride_row_x != ncols_x / 256) return false;
+    if (fusion.shared_up || fusion.x_scale || fusion.gate_scale) return false;
+    const size_t smem = (size_t) (ncols_x / 32) * 36;
+    if (smem > 48 * 1024) return false;
+    if (((uintptr_t) vx & 15) || (fusion.gate && ((uintptr_t) fusion.gate & 15))) return false;
+
+    const bool gate = fusion.gate != nullptr;
+    constexpr int W = 8;
+    const int R = gate ? 1 : 2;
+    if (nrows_x % (W * R) != 0) return false;
+    const dim3 grid(nrows_x / (W * R)), block(32, W);
+    const uint8_t * x = (const uint8_t *) vx;
+    const uint8_t * gt = (const uint8_t *) fusion.gate;
+    const float * xb = (const float *) fusion.x_bias;
+    const float * gb = gate ? (const float *) fusion.gate_bias : nullptr;
+    if (gate) {
+        mul_mat_vec_q4_K_pascal<W, 1, true><<<grid, block, smem, stream>>>(
+            x, gt, (const int *) vy, dst, xb, gb, fusion.glu_op, fusion.glu_limit, ncols_x);
+    } else {
+        mul_mat_vec_q4_K_pascal<W, 2, false><<<grid, block, smem, stream>>>(
+            x, nullptr, (const int *) vy, dst, xb, nullptr, fusion.glu_op, fusion.glu_limit, ncols_x);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pascal-optimised Q6_K matvec (ncols_dst == 1). Q6_K superblocks are 210 B (not 16 B aligned), so
+// each tensor is re-laid-out once into aligned SoA streams (ql / qh / scales / d) kept as a shadow copy.
+// ---------------------------------------------------------------------------------------------
+#include <map>
+#include <mutex>
+
+struct q6k_shadow_t { uint8_t * ql; uint8_t * qh; int8_t * sc; uint8_t * d; };
+
+static std::map<std::pair<const void *, size_t>, q6k_shadow_t> & q6k_shadows() {
+    static std::map<std::pair<const void *, size_t>, q6k_shadow_t> m;
+    return m;
+}
+static std::mutex q6k_mtx;
+
+// Called when a CUDA weight buffer is destroyed: drop every shadow whose source tensor lived inside it,
+// so a reused address can never serve a stale copy.
+void ggml_cuda_q6k_shadow_release(const void * base, size_t size) {
+    std::lock_guard<std::mutex> lock(q6k_mtx);
+    auto & map = q6k_shadows();
+    bool synced = false;
+    for (auto it = map.begin(); it != map.end();) {
+        const char * p = (const char *) it->first.first;
+        if (p >= (const char *) base && p < (const char *) base + size) {
+            if (!synced) { cudaDeviceSynchronize(); synced = true; }
+            if (it->second.ql) { cudaFree(it->second.ql); cudaFree(it->second.qh); cudaFree(it->second.sc); cudaFree(it->second.d); }
+            it = map.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+static __global__ void q6k_repack_kernel(const uint8_t * __restrict__ src, uint8_t * __restrict__ ql,
+        uint8_t * __restrict__ qh, int8_t * __restrict__ sc, uint8_t * __restrict__ d) {
+    const size_t   sb = blockIdx.x;
+    const uint8_t * s = src + sb * 210;
+    for (int i = threadIdx.x; i < 210; i += blockDim.x) {
+        const uint8_t v = s[i];
+        if (i < 128)      ql[sb * 128 + i] = v;
+        else if (i < 192) qh[sb * 64 + (i - 128)] = v;
+        else if (i < 208) sc[sb * 16 + (i - 192)] = (int8_t) v;
+        else              d[sb * 2 + (i - 208)] = v;
+    }
+}
+
+template <int W, int R, int MINB = 1>
+static __global__ void __launch_bounds__(W * 32, MINB)
+mul_mat_vec_q6_K_pascal(
+        const uint8_t * __restrict__ QL, const uint8_t * __restrict__ QH, const int8_t * __restrict__ SC,
+        const half * __restrict__ D, const int * __restrict__ y, float * __restrict__ dst,
+        const float * __restrict__ x_bias, const int ncols) {
+    extern __shared__ int q6k_ys[];
+    const int nsb = ncols >> 8, nblk = ncols >> 5, nint = nblk * 9;
+    int * sums = q6k_ys + nint;
+    ggml_cuda_pdl_sync();
+    for (int i = threadIdx.x + threadIdx.y * 32; i < nint; i += W * 32) q6k_ys[i] = y[i];
+    __syncthreads();
+    for (int i = threadIdx.x + threadIdx.y * 32; i < nblk * 2; i += W * 32) {
+        const int * q = q6k_ys + (i >> 1) * 9 + 1 + 4 * (i & 1);
+        int s = 0;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) s = ggml_cuda_dp4a(0x01010101, q[k], s);
+        sums[i] = s;
+    }
+    __syncthreads();
+
+    const int lane = threadIdx.x, warp = threadIdx.y;
+    const int t = lane & 3, sbl = lane >> 2, n = t >> 1, c = t & 1;
+    const int row0 = (blockIdx.x * W + warp) * R;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.f;
+
+    for (int sb = sbl; sb < nsb; sb += 8) {
+        uint4 A[R], B[R], C[R], S[R];
+        half  dh[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const size_t rs = (size_t) (row0 + r) * nsb + sb;
+            A[r] = __ldg((const uint4 *) (QL + rs * 128 + 64 * n + 16 * c));
+            B[r] = __ldg((const uint4 *) (QL + rs * 128 + 64 * n + 32 + 16 * c));
+            C[r] = __ldg((const uint4 *) (QH + rs * 64 + 32 * n + 16 * c));
+            S[r] = __ldg((const uint4 *) (SC + rs * 16));
+            dh[r] = D[rs];
+        }
+        const int bi0 = sb * 8 + 4 * n;
+        int   a[4][4];
+        float d8[4];
+        int   sm[4];
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            const int * yb = q6k_ys + (bi0 + m) * 9;
+            const int   w0 = yb[0];
+            d8[m] = __low2float(*(const half2 *) &w0);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) a[m][i] = yb[1 + 4 * c + i];
+            sm[m] = sums[(bi0 + m) * 2 + c];
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint32_t wlo = n ? S[r].z : S[r].x, whi = n ? S[r].w : S[r].y;
+            const uint32_t Aw[4] = {A[r].x, A[r].y, A[r].z, A[r].w};
+            const uint32_t Bw[4] = {B[r].x, B[r].y, B[r].z, B[r].w};
+            const uint32_t Cw[4] = {C[r].x, C[r].y, C[r].z, C[r].w};
+            float tot = 0.f;
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                const uint32_t w  = (m >> 1) ? whi : wlo;
+                const int      sh = 8 * (c + 2 * (m & 1));
+                const int      sc = ((int) (w << (24 - sh))) >> 24;
+                int dot = 0;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    uint32_t lo = (m & 1) ? Bw[i] : Aw[i];
+                    lo = (m >> 1) ? (lo >> 4) : lo;
+                    const uint32_t hi = (Cw[i] >> (2 * m)) & 0x03030303u;
+                    dot = ggml_cuda_dp4a((int) ((lo & 0x0F0F0F0Fu) | (hi << 4)), a[m][i], dot);
+                }
+                tot += d8[m] * (float) (sc * (dot - 32 * sm[m]));
+            }
+            acc[r] += __half2float(dh[r]) * tot;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        float v = acc[r];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+        if (lane == 0) dst[row0 + r] = x_bias ? v + x_bias[row0 + r] : v;
+    }
+}
+
+// Returns the re-laid-out shadow copy of a Q6_K tensor, creating it on first use (never during graph capture,
+// and only when enough VRAM is free). false = caller must fall back to the stock kernel.
+static bool q6k_get_shadow(const void * vx, const size_t nblocks, cudaStream_t stream, q6k_shadow_t & sh) {
+    std::lock_guard<std::mutex> lock(q6k_mtx);
+    auto & map = q6k_shadows();
+    auto it = map.find({vx, nblocks});
+    static const bool nocache = [] { const char * e = getenv("GGML_CUDA_Q6K_NOCACHE"); return e && atoi(e) != 0; }();
+    if (nocache && it != map.end()) {  // debug/test mode: tensor memory may be rewritten, rebuild every call
+        cudaDeviceSynchronize();
+        if (it->second.ql) { cudaFree(it->second.ql); cudaFree(it->second.qh); cudaFree(it->second.sc); cudaFree(it->second.d); }
+        map.erase(it);
+        it = map.end();
+    }
+    if (it == map.end()) {
+        cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &st) != cudaSuccess || st != cudaStreamCaptureStatusNone) {
+            cudaGetLastError();
+            return false;  // never allocate while a CUDA graph is being captured
+        }
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        const size_t need = nblocks * 210;
+        if (free_b < need + (size_t) 768 * 1024 * 1024) {
+            map[{vx, nblocks}] = {nullptr, nullptr, nullptr, nullptr};  // no room: remember and fall back
+            return false;
+        }
+        q6k_shadow_t s{};
+        if (cudaMalloc(&s.ql, nblocks * 128) != cudaSuccess || cudaMalloc(&s.qh, nblocks * 64) != cudaSuccess ||
+            cudaMalloc(&s.sc, nblocks * 16) != cudaSuccess || cudaMalloc((void **) &s.d, nblocks * 2) != cudaSuccess) {
+            cudaGetLastError();
+            map[{vx, nblocks}] = {nullptr, nullptr, nullptr, nullptr};
+            return false;
+        }
+        q6k_repack_kernel<<<(unsigned) nblocks, 128, 0, stream>>>((const uint8_t *) vx, s.ql, s.qh, s.sc, s.d);
+        CUDA_CHECK(cudaGetLastError());
+        it = map.emplace(std::make_pair(vx, nblocks), s).first;
+    }
+    sh = it->second;
+    return sh.ql != nullptr;
+}
+
+static bool mul_mat_vec_q6_K_pascal_try(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_row_x,
+        const int nchannels_dst, const int nsamples_dst, cudaStream_t stream) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_Q6K_PASCAL"); return !e || atoi(e) != 0; }();
+    if (!enabled || ids || ncols_dst != 1 || nchannels_dst != 1 || nsamples_dst != 1) return false;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!(GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA)) return false;
+    if (ncols_x % 256 != 0 || stride_row_x != ncols_x / 256) return false;
+    if (fusion.shared_up || fusion.x_scale || fusion.gate_scale || fusion.gate) return false;
+    const size_t smem = (size_t) (ncols_x / 32) * 36 + (size_t) (ncols_x / 16) * 4;
+    if (smem > 48 * 1024) return false;
+    int W, R;
+    if (nrows_x % 16 == 0)     { W = 4; R = 4; }
+    else if (nrows_x % 8 == 0) { W = 8; R = 1; }
+    else return false;
+
+    const size_t nblocks = (size_t) nrows_x * (ncols_x / 256);
+    q6k_shadow_t sh;
+    if (!q6k_get_shadow(vx, nblocks, stream, sh)) return false;
+
+    // Launch variants (GGML_CUDA_Q6K_VARIANT): 0 = 4x4, 1 = 4x4 capped at 4 blocks/SM,
+    // 2 = 4x2 (default, 91 regs, measured ~2.4 % faster per call under Nsight), 3 = 8x2. Falls back to 8x1 when the row count does not divide.
+    static const int variant = [] { const char * e = getenv("GGML_CUDA_Q6K_VARIANT"); return e ? atoi(e) : 2; }();
+    const float * xb = (const float *) fusion.x_bias;
+    const half *  dh = (const half *) sh.d;
+    const int *   yq = (const int *) vy;
+    if (variant == 1 && nrows_x % 16 == 0) {
+        mul_mat_vec_q6_K_pascal<4, 4, 4><<<dim3(nrows_x / 16), dim3(32, 4), smem, stream>>>(sh.ql, sh.qh, sh.sc, dh, yq, dst, xb, ncols_x);
+    } else if (variant == 2 && nrows_x % 8 == 0) {
+        mul_mat_vec_q6_K_pascal<4, 2, 1><<<dim3(nrows_x / 8), dim3(32, 4), smem, stream>>>(sh.ql, sh.qh, sh.sc, dh, yq, dst, xb, ncols_x);
+    } else if (variant == 3 && nrows_x % 16 == 0) {
+        mul_mat_vec_q6_K_pascal<8, 2, 1><<<dim3(nrows_x / 16), dim3(32, 8), smem, stream>>>(sh.ql, sh.qh, sh.sc, dh, yq, dst, xb, ncols_x);
+    } else if (W == 4) {
+        mul_mat_vec_q6_K_pascal<4, 4, 1><<<dim3(nrows_x / 16), dim3(32, 4), smem, stream>>>(sh.ql, sh.qh, sh.sc, dh, yq, dst, xb, ncols_x);
+    } else {
+        mul_mat_vec_q6_K_pascal<8, 1, 1><<<dim3(nrows_x / 8), dim3(32, 8), smem, stream>>>(sh.ql, sh.qh, sh.sc, dh, yq, dst, xb, ncols_x);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Multi-column (2..8 tokens) Q4_K x Q8_1 matvec for Pascal. Weights are decoded once per 16-byte slice and
+// reused for every column. The activations of all N columns are staged in shared memory in an aligned,
+// bank-conflict-free layout, K-chunked so that N*chunk always fits in 46 KB.
+// ---------------------------------------------------------------------------------------------
+template <int W, int R, int N>
+static __global__ void __launch_bounds__(W * 32)
+mul_mat_vec_q4_K_pascal_mc(
+        const uint8_t * __restrict__ vx, const int * __restrict__ y, float * __restrict__ dst,
+        const int ncols, const int csb, const int stride_col_y, const int stride_col_dst) {
+    extern __shared__ __align__(16) uint8_t mc_smem[];
+    const int nsb  = ncols >> 8;
+    const int lane = threadIdx.x, warp = threadIdx.y, tid = lane + warp * 32;
+    const int l8 = lane & 7, sbl = lane >> 3, g = l8 >> 1, h = l8 & 1;
+    const bool hiScale = g >= 2;
+    const int  row0 = (blockIdx.x * W + warp) * R;
+    const size_t rowBytes = (size_t) nsb * 144;
+    const int colStride = csb * 288;   // bytes per column in smem: qs (csb*256) then ds (csb*32)
+
+    float acc[N][R];
+#pragma unroll
+    for (int c = 0; c < N; ++c) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) acc[c][r] = 0.f;
+    }
+
+    ggml_cuda_pdl_sync();
+    for (int c0 = 0; c0 < nsb; c0 += csb) {
+        const int cnt  = min(csb, nsb - c0);
+        const int nblk = cnt * 8;
+        if (c0 > 0) __syncthreads();
+        for (int it = tid; it < N * nblk; it += W * 32) {
+            const int col = it / nblk, b = it - col * nblk;
+            const int * src = y + ((size_t) col * stride_col_y + (size_t) c0 * 8 + b) * 9;
+            const int w0 = src[0];
+            int q[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) q[i] = src[1 + i];
+            int4 * yq = (int4 *) (mc_smem + (size_t) col * colStride);
+            const int sw = ((b >> 2) & 1) << 1;
+            yq[(b * 2 + 0) ^ sw] = make_int4(q[0], q[1], q[2], q[3]);
+            yq[(b * 2 + 1) ^ sw] = make_int4(q[4], q[5], q[6], q[7]);
+            ((int *) (mc_smem + (size_t) col * colStride + csb * 256))[b] = w0;
+        }
+        __syncthreads();
+
+        for (int sbi = sbl; sbi < cnt; sbi += 4) {
+            const int sb = c0 + sbi;
+            uint4 hd[R], qq[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const uint4 * blk = (const uint4 *) (vx + (size_t) (row0 + r) * rowBytes + (size_t) sb * 144);
+                hd[r] = __ldg(blk);
+                qq[r] = __ldg(blk + 1 + l8);
+            }
+            // decode weights once (shared by all columns)
+            int   ql[R][4], qh[R][4];
+            float dx[R], dm[R];
+            uint32_t sc0[R], sc1[R], m0[R], m1[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float2   dd  = __half22float2(*(const half2 *) &hd[r].x);
+                dx[r] = dd.x; dm[r] = dd.y;
+                const uint64_t lo8 = ((uint64_t) hd[r].z << 32) | hd[r].y;
+                const uint32_t w2  = hd[r].w;
+                uint32_t sc[2], mn[2];
+#pragma unroll
+                for (int k = 0; k < 2; ++k) {
+                    const int      j  = 2 * g + k, jj = j & 3;
+                    const uint32_t bj = (uint32_t) (lo8 >> (8 * j)) & 0xFF;
+                    const uint32_t bm = (uint32_t) (lo8 >> (8 * (j + 4))) & 0xFF;
+                    const uint32_t bl = (uint32_t) (lo8 >> (8 * jj)) & 0xFF;
+                    const uint32_t b2 = (w2 >> (8 * jj)) & 0xFF;
+                    const uint32_t scA = bj & 63, mA = bm & 63;
+                    const uint32_t scB = (b2 & 0xF) | ((bl >> 6) << 4), mB = (b2 >> 4) | ((bj >> 6) << 4);
+                    sc[k] = hiScale ? scB : scA;
+                    mn[k] = hiScale ? mB : mA;
+                }
+                sc0[r] = sc[0]; sc1[r] = sc[1]; m0[r] = mn[0]; m1[r] = mn[1];
+                const uint32_t qv[4] = {qq[r].x, qq[r].y, qq[r].z, qq[r].w};
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    ql[r][i] = (int) (qv[i] & 0x0F0F0F0Fu);
+                    qh[r][i] = (int) ((qv[i] >> 4) & 0x0F0F0F0Fu);
+                }
+            }
+            const int blo = sbi * 8 + 2 * g;                 // local block index of the low sub-block
+            const int sw  = ((blo >> 2) & 1) << 1;           // same swizzle for blo and blo+1
+#pragma unroll
+            for (int c = 0; c < N; ++c) {
+                const int4 * yq = (const int4 *) (mc_smem + (size_t) c * colStride);
+                const int4 alo = yq[(blo * 2 + h) ^ sw];
+                const int4 ahi = yq[((blo + 1) * 2 + h) ^ sw];
+                const int2 dsp = ((const int2 *) (mc_smem + (size_t) c * colStride + csb * 256))[blo >> 1];
+                const float2 flo = __half22float2(*(const half2 *) &dsp.x);
+                const float2 fhi = __half22float2(*(const half2 *) &dsp.y);
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    int dl = ggml_cuda_dp4a(ql[r][0], alo.x, 0);
+                    dl = ggml_cuda_dp4a(ql[r][1], alo.y, dl);
+                    dl = ggml_cuda_dp4a(ql[r][2], alo.z, dl);
+                    dl = ggml_cuda_dp4a(ql[r][3], alo.w, dl);
+                    int dh = ggml_cuda_dp4a(qh[r][0], ahi.x, 0);
+                    dh = ggml_cuda_dp4a(qh[r][1], ahi.y, dh);
+                    dh = ggml_cuda_dp4a(qh[r][2], ahi.z, dh);
+                    dh = ggml_cuda_dp4a(qh[r][3], ahi.w, dh);
+                    float v = dx[r] * (flo.x * (float) ((int) sc0[r] * dl) + fhi.x * (float) ((int) sc1[r] * dh));
+                    if (h == 0) v -= dm[r] * (flo.y * (float) m0[r] + fhi.y * (float) m1[r]);
+                    acc[c][r] += v;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < N; ++c) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            float v = acc[c][r];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lane == 0) dst[(size_t) c * stride_col_dst + row0 + r] = v;
+        }
+    }
+}
+
+template <int N>
+static void mul_mat_vec_q4_K_pascal_mc_launch(const uint8_t * vx, const int * y, float * dst, int ncols, int nrows,
+        int stride_col_y, int stride_col_dst, int W, int R, cudaStream_t stream) {
+    const int nsb = ncols / 256;
+    const int csb = std::max(1, std::min(nsb, 46000 / (288 * N)));
+    const size_t smem = (size_t) N * csb * 288;
+#define Q4MC(WW, RR) mul_mat_vec_q4_K_pascal_mc<WW, RR, N><<<dim3(nrows / (WW * RR)), dim3(32, WW), smem, stream>>>( \
+        vx, y, dst, ncols, csb, stride_col_y, stride_col_dst)
+    if (W == 4 && R == 2)      { Q4MC(4, 2); }
+    else if (W == 8 && R == 1) { Q4MC(8, 1); }
+    else if (W == 8 && R == 2) { Q4MC(8, 2); }
+    else if (W == 8 && R == 4) { Q4MC(8, 4); }
+    else if (W == 16 && R == 1) { Q4MC(16, 1); }
+    else if (W == 16 && R == 2) { Q4MC(16, 2); }
+    else                       { Q4MC(4, 1); }
+#undef Q4MC
+}
+
+// Returns true when the multi-column Pascal Q4_K path handled the call.
+static bool mul_mat_vec_q4_K_pascal_mc_try(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_row_x, const int stride_col_y,
+        const int stride_col_dst, const int nchannels_dst, const int nsamples_dst, cudaStream_t stream) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_MULTICOL"); return !e || atoi(e) != 0; }();
+    if (!enabled || ids || ncols_dst < 2 || ncols_dst > 8 || nchannels_dst != 1 || nsamples_dst != 1) return false;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!(GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA)) return false;
+    if (ncols_x % 256 != 0 || stride_row_x != ncols_x / 256) return false;
+    if (fusion.gate || fusion.x_bias || fusion.shared_up || fusion.x_scale || fusion.gate_scale) return false;
+    if (((uintptr_t) vx & 15)) return false;
+    static const int cfg = [] { const char * e = getenv("GGML_CUDA_MC_CFG"); return e ? atoi(e) : 2; }();
+    int W = 8, R = 1;
+    if (cfg == 1) { W = 4; R = 2; } else if (cfg == 2) { W = 8; R = 2; } else if (cfg == 3) { W = 4; R = 1; } else if (cfg == 4) { W = 8; R = 4; } else if (cfg == 5) { W = 16; R = 1; } else if (cfg == 6) { W = 16; R = 2; }
+    if (nrows_x % (W * R) != 0) return false;
+    const uint8_t * x = (const uint8_t *) vx;
+    const int *     y = (const int *) vy;
+    switch (ncols_dst) {
+        case 2: mul_mat_vec_q4_K_pascal_mc_launch<2>(x, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst, W, R, stream); break;
+        case 3: mul_mat_vec_q4_K_pascal_mc_launch<3>(x, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst, W, R, stream); break;
+        case 4: mul_mat_vec_q4_K_pascal_mc_launch<4>(x, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst, W, R, stream); break;
+        case 5: mul_mat_vec_q4_K_pascal_mc_launch<5>(x, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst, W, R, stream); break;
+        case 6: mul_mat_vec_q4_K_pascal_mc_launch<6>(x, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst, W, R, stream); break;
+        case 7: mul_mat_vec_q4_K_pascal_mc_launch<7>(x, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst, W, R, stream); break;
+        default: mul_mat_vec_q4_K_pascal_mc_launch<8>(x, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst, W, R, stream); break;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Multi-column (2..8 tokens) Q6_K matvec on the re-laid-out shadow weights. Weight bits are unpacked once per
+// slice and reused by every column; activations (qs + scale + per-16 sums) are staged K-chunked in shared memory.
+// ---------------------------------------------------------------------------------------------
+template <int W, int R, int N>
+static __global__ void __launch_bounds__(W * 32)
+mul_mat_vec_q6_K_pascal_mc(
+        const uint8_t * __restrict__ QL, const uint8_t * __restrict__ QH, const int8_t * __restrict__ SC,
+        const half * __restrict__ D, const int * __restrict__ y, float * __restrict__ dst,
+        const int ncols, const int csb, const int stride_col_y, const int stride_col_dst) {
+    extern __shared__ __align__(16) uint8_t mc6_smem[];
+    const int nsb  = ncols >> 8;
+    const int lane = threadIdx.x, warp = threadIdx.y, tid = lane + warp * 32;
+    const int t = lane & 3, sbl = lane >> 2, n = t >> 1, c = t & 1;
+    const int row0 = (blockIdx.x * W + warp) * R;
+    const int colStride = csb * 384;   // per column: qs (csb*256 B) then meta {d8, sum0, sum1, 0} (csb*128 B)
+
+    float acc[N][R];
+#pragma unroll
+    for (int k = 0; k < N; ++k) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) acc[k][r] = 0.f;
+    }
+
+    ggml_cuda_pdl_sync();
+    for (int c0 = 0; c0 < nsb; c0 += csb) {
+        const int cnt  = min(csb, nsb - c0);
+        const int nblk = cnt * 8;
+        if (c0 > 0) __syncthreads();
+        for (int it = tid; it < N * nblk; it += W * 32) {
+            const int col = it / nblk, b = it - col * nblk;
+            const int * src = y + ((size_t) col * stride_col_y + (size_t) c0 * 8 + b) * 9;
+            const int w0 = src[0];
+            int q[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) q[i] = src[1 + i];
+            int s0 = 0, s1 = 0;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                s0 = ggml_cuda_dp4a(0x01010101, q[i], s0);
+                s1 = ggml_cuda_dp4a(0x01010101, q[4 + i], s1);
+            }
+            int4 * yq = (int4 *) (mc6_smem + (size_t) col * colStride);
+            const int swq = (((b >> 3) & 1) << 2) | (((b >> 2) & 1) << 1);
+            yq[(b * 2 + 0) ^ swq] = make_int4(q[0], q[1], q[2], q[3]);
+            yq[(b * 2 + 1) ^ swq] = make_int4(q[4], q[5], q[6], q[7]);
+            int4 * meta = (int4 *) (mc6_smem + (size_t) col * colStride + csb * 256);
+            meta[b ^ (((b >> 3) & 1) << 1)] = make_int4(__float_as_int(__low2float(*(const half2 *) &w0)), s0, s1, 0);
+        }
+        __syncthreads();
+
+        for (int sbi = sbl; sbi < cnt; sbi += 8) {
+            const int sb = c0 + sbi;
+            int   qm[R][4][4];
+            int   scm[R][4];
+            float dw[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const size_t rs = (size_t) (row0 + r) * nsb + sb;
+                const uint4 A = __ldg((const uint4 *) (QL + rs * 128 + 64 * n + 16 * c));
+                const uint4 B = __ldg((const uint4 *) (QL + rs * 128 + 64 * n + 32 + 16 * c));
+                const uint4 C = __ldg((const uint4 *) (QH + rs * 64 + 32 * n + 16 * c));
+                const uint4 S = __ldg((const uint4 *) (SC + rs * 16));
+                dw[r] = __half2float(D[rs]);
+                const uint32_t wlo = n ? S.z : S.x, whi = n ? S.w : S.y;
+                const uint32_t Aw[4] = {A.x, A.y, A.z, A.w};
+                const uint32_t Bw[4] = {B.x, B.y, B.z, B.w};
+                const uint32_t Cw[4] = {C.x, C.y, C.z, C.w};
+#pragma unroll
+                for (int m = 0; m < 4; ++m) {
+                    const uint32_t w  = (m >> 1) ? whi : wlo;
+                    const int      sh = 8 * (c + 2 * (m & 1));
+                    scm[r][m] = ((int) (w << (24 - sh))) >> 24;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        uint32_t lo = (m & 1) ? Bw[i] : Aw[i];
+                        lo = (m >> 1) ? (lo >> 4) : lo;
+                        const uint32_t hi = (Cw[i] >> (2 * m)) & 0x03030303u;
+                        qm[r][m][i] = (int) ((lo & 0x0F0F0F0Fu) | (hi << 4));
+                    }
+                }
+            }
+            float tot[N][R];
+#pragma unroll
+            for (int k = 0; k < N; ++k) {
+#pragma unroll
+                for (int r = 0; r < R; ++r) tot[k][r] = 0.f;
+            }
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                const int b   = sbi * 8 + 4 * n + m;
+                const int pq  = (b * 2 + c) ^ ((((b >> 3) & 1) << 2) | (((b >> 2) & 1) << 1));
+                const int pm  = b ^ (((b >> 3) & 1) << 1);
+#pragma unroll
+                for (int k = 0; k < N; ++k) {
+                    const int4 a  = ((const int4 *) (mc6_smem + (size_t) k * colStride))[pq];
+                    const int4 mt = ((const int4 *) (mc6_smem + (size_t) k * colStride + csb * 256))[pm];
+                    const float d8 = __int_as_float(mt.x);
+                    const int   sm = c ? mt.z : mt.y;
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        int dot = ggml_cuda_dp4a(qm[r][m][0], a.x, 0);
+                        dot = ggml_cuda_dp4a(qm[r][m][1], a.y, dot);
+                        dot = ggml_cuda_dp4a(qm[r][m][2], a.z, dot);
+                        dot = ggml_cuda_dp4a(qm[r][m][3], a.w, dot);
+                        tot[k][r] += d8 * (float) (scm[r][m] * (dot - 32 * sm));
+                    }
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < N; ++k) {
+#pragma unroll
+                for (int r = 0; r < R; ++r) acc[k][r] += dw[r] * tot[k][r];
+            }
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < N; ++k) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            float v = acc[k][r];
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            if (lane == 0) dst[(size_t) k * stride_col_dst + row0 + r] = v;
+        }
+    }
+}
+
+template <int N>
+static void mul_mat_vec_q6_K_pascal_mc_launch(const q6k_shadow_t & sh, const int * y, float * dst, int ncols, int nrows,
+        int stride_col_y, int stride_col_dst, int W, int R, cudaStream_t stream) {
+    const int nsb = ncols / 256;
+    const int csb = std::max(1, std::min(nsb, 46000 / (384 * N)));
+    const size_t smem = (size_t) N * csb * 384;
+    const half * dh = (const half *) sh.d;
+#define Q6MC(WW, RR) mul_mat_vec_q6_K_pascal_mc<WW, RR, N><<<dim3(nrows / (WW * RR)), dim3(32, WW), smem, stream>>>( \
+        sh.ql, sh.qh, sh.sc, dh, y, dst, ncols, csb, stride_col_y, stride_col_dst)
+    if (W == 4 && R == 2)      { Q6MC(4, 2); }
+    else if (W == 8 && R == 1) { Q6MC(8, 1); }
+    else if (W == 8 && R == 2) { Q6MC(8, 2); }
+    else if (W == 8 && R == 4) { Q6MC(8, 4); }
+    else if (W == 16 && R == 1) { Q6MC(16, 1); }
+    else if (W == 16 && R == 2) { Q6MC(16, 2); }
+    else                       { Q6MC(4, 1); }
+#undef Q6MC
+}
+
+static bool mul_mat_vec_q6_K_pascal_mc_try(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_row_x, const int stride_col_y,
+        const int stride_col_dst, const int nchannels_dst, const int nsamples_dst, cudaStream_t stream) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_MULTICOL"); return !e || atoi(e) != 0; }();
+    static const bool enabled6 = [] { const char * e = getenv("GGML_CUDA_Q6K_PASCAL"); return !e || atoi(e) != 0; }();
+    if (!enabled || !enabled6 || ids || ncols_dst < 2 || ncols_dst > 8 || nchannels_dst != 1 || nsamples_dst != 1) return false;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!(GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA)) return false;
+    if (ncols_x % 256 != 0 || stride_row_x != ncols_x / 256) return false;
+    if (fusion.gate || fusion.x_bias || fusion.shared_up || fusion.x_scale || fusion.gate_scale) return false;
+    static const int cfg = [] { const char * e = getenv("GGML_CUDA_MC6_CFG"); return e ? atoi(e) : 2; }();
+    int W = 8, R = 1;
+    if (cfg == 1) { W = 4; R = 2; } else if (cfg == 2) { W = 8; R = 2; } else if (cfg == 3) { W = 4; R = 1; } else if (cfg == 4) { W = 8; R = 4; } else if (cfg == 5) { W = 16; R = 1; } else if (cfg == 6) { W = 16; R = 2; }
+    if (nrows_x % (W * R) != 0) return false;
+    q6k_shadow_t sh;
+    if (!q6k_get_shadow(vx, (size_t) nrows_x * (ncols_x / 256), stream, sh)) return false;
+    const int * y = (const int *) vy;
+    switch (ncols_dst) {
+        case 2: mul_mat_vec_q6_K_pascal_mc_launch<2>(sh, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst, W, R, stream); break;
+        case 3: mul_mat_vec_q6_K_pascal_mc_launch<3>(sh, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst, W, R, stream); break;
+        case 4: mul_mat_vec_q6_K_pascal_mc_launch<4>(sh, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst, W, R, stream); break;
+        case 5: mul_mat_vec_q6_K_pascal_mc_launch<5>(sh, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst, W, R, stream); break;
+        case 6: mul_mat_vec_q6_K_pascal_mc_launch<6>(sh, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst, W, R, stream); break;
+        case 7: mul_mat_vec_q6_K_pascal_mc_launch<7>(sh, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst, W, R, stream); break;
+        default: mul_mat_vec_q6_K_pascal_mc_launch<8>(sh, y, dst, ncols_x, nrows_x, stride_col_y, stride_col_dst, W, R, stream); break;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1192,6 +1916,31 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
     GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
+
+    if constexpr (type == GGML_TYPE_Q6_K) {
+        if (mul_mat_vec_q6_K_pascal_mc_try(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x,
+                                           stride_col_y, stride_col_dst, nchannels_dst, nsamples_dst, stream)) {
+            return;
+        }
+    }
+    if constexpr (type == GGML_TYPE_Q6_K) {
+        if (mul_mat_vec_q6_K_pascal_try(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x,
+                                        nchannels_dst, nsamples_dst, stream)) {
+            return;
+        }
+    }
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        if (mul_mat_vec_q4_K_pascal_mc_try(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x,
+                                           stride_col_y, stride_col_dst, nchannels_dst, nsamples_dst, stream)) {
+            return;
+        }
+    }
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        if (mul_mat_vec_q4_K_pascal_try(vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x,
+                                        nchannels_dst, nsamples_dst, stream)) {
+            return;
+        }
+    }
 
     const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
     const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
