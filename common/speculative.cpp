@@ -405,6 +405,36 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
+                // greedy draft without a confidence threshold: plain argmax, no top-k over the whole vocab
+                static const bool fast_argmax = [] { const char * e = getenv("SPEC_DRAFT_FAST_ARGMAX"); return !e || atoi(e) != 0; }();
+                if (fast_argmax && !dparams.at(seq_id).result_q && params.p_min <= 0.0f) {
+                    const float * logits = llama_get_logits_ith(ctx_dft, i_batch);
+                    ++i_batch;
+                    int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                    static const int vocab_limit = [] { const char * e = getenv("LLAMA_DRAFT_VOCAB_LIMIT"); return e ? atoi(e) : 0; }();
+                    if (vocab_limit > 0 && vocab_limit < n_vocab) n_vocab = vocab_limit;
+                    llama_token id_max = 0;
+                    float       v_max  = logits[0];
+                    for (int t = 1; t < n_vocab; ++t) {
+                        if (logits[t] > v_max) { v_max = logits[t]; id_max = t; }
+                    }
+
+                    common_sampler_accept(smpl, id_max, true);
+
+                    auto & dpf = dparams.at(seq_id);
+                    dpf.result->push_back(id_max);
+
+                    if ((params.n_max <= (int) dpf.result->size()) ||
+                        (dpf.n_max > 0 && dpf.n_max <= (int) dpf.result->size())) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+                        continue;
+                    }
+
+                    batch.add(id_max, dpf.pos0 + i + 1, seq_id, true);
+                    continue;
+                }
+
                 const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_batch, true);
                 ++i_batch;
 

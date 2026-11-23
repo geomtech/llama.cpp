@@ -915,6 +915,213 @@ static void rms_norm_mul_rope_cuda(
     }
 }
 
+// Two independent fused RMS_NORM + MUL + ROPE chains (Q, and K with the SET_ROWS into the KV cache) in one launch.
+// Blocks [0, a.nrows) run chain A, the others chain B. Same arithmetic as rms_norm_mul_rope_f32.
+struct rmr_args {
+    const float * x; void * dst;
+    int ncols, nchannels, nsamples, nrows;
+    int64_t s01, s02, s03, s1, s2, s3;
+    float eps;
+    const float * mul;
+    int64_t mul_s01, mul_s02, mul_s03;
+    uint3 mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed;
+    int n_dims;
+    const int32_t * pos;
+    float freq_scale, ext_factor, attn_factor;
+    rope_corr_dims corr_dims;
+    float theta_scale;
+    const float * freq_factors;
+    const int64_t * row_indices;
+    int set_rows_stride;
+    bool is_neox;
+};
+
+template <int block_size, typename D>
+static __device__ __forceinline__ void rms_norm_mul_rope_body(const rmr_args & a, const int row, float * s_sum) {
+    const int tid = threadIdx.x;
+    for (int sample = blockIdx.z; sample < a.nsamples; sample += gridDim.z) {
+        for (int channel = blockIdx.y; channel < a.nchannels; channel += gridDim.y) {
+            const float * xc = a.x + sample*a.s03 + channel*a.s02 + row*a.s01;
+
+            const uint32_t mul_row     = fastmodulo(row,     a.mul_nrows_packed);
+            const uint32_t mul_channel = fastmodulo(channel, a.mul_nchannels_packed);
+            const uint32_t mul_sample  = fastmodulo(sample,  a.mul_nsamples_packed);
+            const float * mulc = a.mul + mul_sample*a.mul_s03 + mul_channel*a.mul_s02 + mul_row*a.mul_s01;
+
+            float tmp = 0.0f;
+            for (int col = tid; col < a.ncols; col += block_size) {
+                const float xi = xc[col];
+                tmp += xi * xi;
+            }
+
+            tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+            const float scale = rsqrtf(tmp/a.ncols + a.eps);
+
+            int64_t idst = sample*a.s3 + channel*a.s2 + row*a.s1;
+            if (a.set_rows_stride != 0) {
+                idst = row*a.s1 + a.row_indices[channel]*a.set_rows_stride;
+            }
+            D * dstc = (D *) a.dst + idst;
+
+            for (int i0 = 2*tid; i0 < a.ncols; i0 += 2*block_size) {
+                int ix0;
+                int ix1;
+                if (a.is_neox && i0 < a.n_dims) {
+                    ix0 = i0/2;
+                    ix1 = i0/2 + a.n_dims/2;
+                } else {
+                    ix0 = i0 + 0;
+                    ix1 = i0 + 1;
+                }
+
+                const float x0 = scale * xc[ix0] * mulc[fastmodulo(ix0, a.mul_ncols_packed)];
+                const float x1 = scale * xc[ix1] * mulc[fastmodulo(ix1, a.mul_ncols_packed)];
+
+                if (i0 >= a.n_dims) {
+                    dstc[ix0] = ggml_cuda_cast<D>(x0);
+                    dstc[ix1] = ggml_cuda_cast<D>(x1);
+                    continue;
+                }
+
+                const float theta_base  = a.pos[channel]*powf(a.theta_scale, i0/2.0f);
+                const float freq_factor = a.freq_factors != nullptr ? a.freq_factors[i0/2] : 1.0f;
+
+                float cos_theta;
+                float sin_theta;
+                rope_yarn<true>(theta_base/freq_factor, a.freq_scale, a.corr_dims, i0, a.ext_factor, a.attn_factor, cos_theta, sin_theta);
+
+                dstc[ix0] = ggml_cuda_cast<D>(x0*cos_theta - x1*sin_theta);
+                dstc[ix1] = ggml_cuda_cast<D>(x0*sin_theta + x1*cos_theta);
+            }
+
+            if constexpr (block_size > WARP_SIZE) {
+                __syncthreads();
+            }
+        }
+    }
+}
+
+// Optional third role: rows of an f32 matrix (the V projection) converted to f16 into KV cache rows idx[channel].
+struct rmr_vcopy {
+    const float *   v;        // [ncols, nchannels] contiguous
+    __half *        cache;    // nullptr: no copy
+    const int64_t * idx;      // row index per channel
+    long long       cstride;  // cache row stride in halves (multiple of 4)
+    int             ncols;    // multiple of 4
+    int             nblocks;  // blocks per channel
+};
+
+template <int block_size, typename DA, typename DB>
+static __global__ void __launch_bounds__(block_size)
+rms_norm_mul_rope_dual_kernel(const rmr_args a, const rmr_args b, const rmr_vcopy vc) {
+    extern __shared__ float s_sum[];
+    if ((int) blockIdx.x < a.nrows) {
+        rms_norm_mul_rope_body<block_size, DA>(a, blockIdx.x, s_sum);
+    } else if ((int) blockIdx.x < a.nrows + b.nrows) {
+        rms_norm_mul_rope_body<block_size, DB>(b, blockIdx.x - a.nrows, s_sum);
+    } else {
+        const int vb = blockIdx.x - a.nrows - b.nrows;
+        for (int channel = blockIdx.y; channel < a.nchannels; channel += gridDim.y) {
+            const float * src = vc.v + (size_t) channel * vc.ncols;
+            __half *      dst = vc.cache + vc.idx[channel] * vc.cstride;
+            for (int e = (vb * block_size + threadIdx.x) * 4; e < vc.ncols; e += vc.nblocks * block_size * 4) {
+                const float4 f = *(const float4 *) (src + e);
+                const __half2 h0 = __floats2half2_rn(f.x, f.y);
+                const __half2 h1 = __floats2half2_rn(f.z, f.w);
+                *(__half2 *) (dst + e)     = h0;
+                *(__half2 *) (dst + e + 2) = h1;
+            }
+        }
+    }
+}
+
+static bool rmr_make_args(const ggml_tensor * rms_norm, const ggml_tensor * mul, const ggml_tensor * rope, const ggml_tensor * set_rows, rmr_args & a) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * mul_src = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    if (x->type != GGML_TYPE_F32 || mul_src->type != GGML_TYPE_F32 || rope->type != GGML_TYPE_F32) return false;
+    if (x->nb[0] != sizeof(float) || mul_src->nb[0] != sizeof(float)) return false;
+    if (rope->src[1] == nullptr || rope->src[1]->type != GGML_TYPE_I32) return false;
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    a.dst             = rope->data;
+    a.row_indices     = nullptr;
+    a.set_rows_stride = 0;
+    if (set_rows != nullptr) {
+        if (set_rows->type != GGML_TYPE_F16 || set_rows->src[1]->type != GGML_TYPE_I64) return false;
+        a.dst             = set_rows->data;
+        a.row_indices     = (const int64_t *) set_rows->src[1]->data;
+        a.set_rows_stride = set_rows->nb[1] / ggml_type_size(set_rows->type);
+    }
+
+    const int n_dims     = ((const int32_t *) rope->op_params)[1];
+    const int mode       = ((const int32_t *) rope->op_params)[2];
+    const int n_ctx_orig = ((const int32_t *) rope->op_params)[4];
+
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    memcpy(&freq_base,   (const int32_t *) rope->op_params +  5, sizeof(float));
+    memcpy(&freq_scale,  (const int32_t *) rope->op_params +  6, sizeof(float));
+    memcpy(&ext_factor,  (const int32_t *) rope->op_params +  7, sizeof(float));
+    memcpy(&attn_factor, (const int32_t *) rope->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,   (const int32_t *) rope->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,   (const int32_t *) rope->op_params + 10, sizeof(float));
+
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, ggml_rope_get_truncate(rope), a.corr_dims.v);
+
+    a.x = (const float *) x->data;
+    a.ncols = x->ne[0]; a.nrows = x->ne[1]; a.nchannels = x->ne[2]; a.nsamples = x->ne[3];
+    a.s01 = x->nb[1] / sizeof(float); a.s02 = x->nb[2] / sizeof(float); a.s03 = x->nb[3] / sizeof(float);
+    a.s1 = rope->nb[1] / sizeof(float); a.s2 = rope->nb[2] / sizeof(float); a.s3 = rope->nb[3] / sizeof(float);
+    a.eps = eps;
+    a.mul = (const float *) mul_src->data;
+    a.mul_s01 = mul_src->nb[1] / sizeof(float); a.mul_s02 = mul_src->nb[2] / sizeof(float); a.mul_s03 = mul_src->nb[3] / sizeof(float);
+    a.mul_ncols_packed     = init_fastdiv_values(mul_src->ne[0]);
+    a.mul_nrows_packed     = init_fastdiv_values(mul_src->ne[1]);
+    a.mul_nchannels_packed = init_fastdiv_values(mul_src->ne[2]);
+    a.mul_nsamples_packed  = init_fastdiv_values(mul_src->ne[3]);
+    a.n_dims = n_dims;
+    a.pos = (const int32_t *) rope->src[1]->data;
+    a.freq_scale = freq_scale; a.ext_factor = ext_factor; a.attn_factor = attn_factor;
+    a.theta_scale = powf(freq_base, -2.0f/n_dims);
+    a.freq_factors = rope->src[2] != nullptr ? (const float *) rope->src[2]->data : nullptr;
+    a.is_neox = mode & GGML_ROPE_TYPE_NEOX;
+    return a.ncols % 2 == 0 && a.ncols < 1024;
+}
+
+// Chain A = Q (RMS_NORM, MUL, ROPE -> f32), chain B = K (RMS_NORM, MUL, ROPE, VIEW, SET_ROWS -> f16 cache). Returns false if not applicable.
+// v_mm / v_set_rows (optional): the V projection and the SET_ROWS writing it to the F16 V cache, done by the same launch.
+bool ggml_cuda_op_rms_norm_mul_rope_dual(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * q_rms, const ggml_tensor * q_mul, const ggml_tensor * q_rope,
+        const ggml_tensor * k_rms, const ggml_tensor * k_mul, const ggml_tensor * k_rope, const ggml_tensor * k_set_rows,
+        const ggml_tensor * v_mm, const ggml_tensor * v_set_rows) {
+    rmr_args a{}, b{};
+    if (!rmr_make_args(q_rms, q_mul, q_rope, nullptr, a) || !rmr_make_args(k_rms, k_mul, k_rope, k_set_rows, b)) return false;
+    if (a.nchannels != b.nchannels || a.nsamples != b.nsamples) return false;
+    rmr_vcopy vc{};
+    int v_blocks = 0;
+    if (v_mm != nullptr && v_set_rows != nullptr) {
+        const int64_t ncols = v_mm->ne[0];
+        if (v_mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(v_mm) || v_mm->ne[1] != a.nchannels || v_mm->ne[2] != 1 || v_mm->ne[3] != 1 ||
+                ncols % 4 != 0 || ((uintptr_t) v_mm->data & 15) || v_set_rows->type != GGML_TYPE_F16 || v_set_rows->src[1]->type != GGML_TYPE_I64 ||
+                (v_set_rows->nb[1] / sizeof(ggml_fp16_t)) % 4 != 0 || ((uintptr_t) v_set_rows->data & 7)) {
+            return false;
+        }
+        vc.v       = (const float *) v_mm->data;
+        vc.cache   = (__half *) v_set_rows->data;
+        vc.idx     = (const int64_t *) v_set_rows->src[1]->data;
+        vc.cstride = (long long) (v_set_rows->nb[1] / sizeof(ggml_fp16_t));
+        vc.ncols   = (int) ncols;
+        v_blocks   = (int) ((ncols/4 + 255) / 256);
+        vc.nblocks = v_blocks;
+    }
+    const dim3 blocks_num(a.nrows + b.nrows + v_blocks, MIN(a.nchannels, UINT16_MAX), MIN(a.nsamples, UINT16_MAX));
+    rms_norm_mul_rope_dual_kernel<256, float, half><<<blocks_num, 256, 32*sizeof(float), ctx.stream()>>>(a, b, vc);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
         ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * rope, ggml_tensor * set_rows) {
     const ggml_tensor * x = rms_norm->src[0];

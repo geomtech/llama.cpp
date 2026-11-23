@@ -773,7 +773,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     if (can_use_vector_kernel) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
             if (Q->ne[1] == 1) {
-                if (!gqa_opt_applies) {
+                static const bool vec_decode = [] { const char * e = getenv("GGML_CUDA_FATTN_VEC"); return e && atoi(e) != 0; }();
+                if (!gqa_opt_applies || vec_decode) {
                     return BEST_FATTN_KERNEL_VEC;
                 }
             }

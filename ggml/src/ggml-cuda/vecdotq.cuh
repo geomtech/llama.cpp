@@ -549,7 +549,13 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
 
         const float2 ds8f = __half22float2(ds8[i]);
 
+        // sc < 64 and |sumi_d| < 2^16: the product is below 2^24, so the float product is exact and equal to the int one,
+        // without the 32 bit integer multiply (emulated with several XMAD on Pascal)
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
         sumf_d += ds8f.x * (sc[i] * sumi_d);
+#else
+        sumf_d += ds8f.x * ((float) sc[i] * (float) sumi_d);
+#endif
         sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
     }
 
@@ -675,7 +681,12 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
             sumi_d.y = ggml_cuda_dp4a(v[2*i+5], u[2*i+5], sumi_d.y); // SIMD dot product
         }
 
+        // |sc| <= 127 and |sumi| < 2^16: every product and the sum stay below 2^24, so the float math is exact
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
         sumf_d += d8[i0/4] * (sc_reg[i0/2+0]*sumi_d.x + sc_reg[i0/2+1]*sumi_d.y);
+#else
+        sumf_d += d8[i0/4] * fmaf((float) sc_reg[i0/2+1], (float) sumi_d.y, (float) sc_reg[i0/2+0] * (float) sumi_d.x);
+#endif
     }
 
     return d6 * sumf_d;

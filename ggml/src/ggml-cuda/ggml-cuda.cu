@@ -1034,6 +1034,9 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_q6k_shadow_release(ctx->dev_ptr, ggml_backend_buffer_get_size(buffer));
+    ggml_cuda_q80_shadow_release(ctx->dev_ptr, ggml_backend_buffer_get_size(buffer));
     delete ctx;
 }
 
@@ -2346,8 +2349,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     bool use_mul_mat_vec_q = ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]) && !bad_padding_clear &&
                              src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
-    // fusion is not universally faster on Pascal
-    if (cc < GGML_CUDA_CC_VOLTA) {
+    // fusion is not universally faster on Pascal; only our Q8_0 Pascal kernel is known to profit
+    static const bool q80_fuse = [] { const char * e = getenv("GGML_CUDA_Q80_FUSE"); return !e || atoi(e) != 0; }();
+    if (cc < GGML_CUDA_CC_VOLTA && !(q80_fuse && src0->type == GGML_TYPE_Q8_0)) {
         return false;
     }
     //we only support fusion for ncols_dst = 1
@@ -4474,6 +4478,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mul_mat_vec_q8_0_qkv(*cuda_ctx, cgraph, i)) {
+        return 2;
+    }
+
+    // residual ADD followed by RMS_NORM + MUL: one kernel computes the sum, the norm and the Q8_1 copy
+    if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes) {
+        ggml_tensor * rms_n = cgraph->nodes[i + 1];
+        ggml_tensor * mul_n = cgraph->nodes[i + 2];
+        if (rms_n->op == GGML_OP_RMS_NORM && rms_n->src[0] == node && mul_n->op == GGML_OP_MUL &&
+                ggml_cuda_can_fuse(cgraph, i + 1, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+            bool has_mmvq_consumer = false;
+            for (int j = i + 3; j < cgraph->n_nodes && j < i + 9 && !has_mmvq_consumer; ++j) {
+                const ggml_tensor * c = cgraph->nodes[j];
+                has_mmvq_consumer = c->op == GGML_OP_MUL_MAT && c->src[1] == mul_n &&
+                    (c->src[0]->type == GGML_TYPE_Q8_0 || c->src[0]->type == GGML_TYPE_Q4_K || c->src[0]->type == GGML_TYPE_Q6_K);
+            }
+            if (has_mmvq_consumer && ggml_cuda_add_rms_norm_mul_q8_1(*cuda_ctx, node, rms_n, mul_n)) {
+                return 2;
+            }
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
@@ -5240,6 +5266,59 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // Pascal: the Q chain (RMS_NORM, MUL, ROPE) and the K chain (+ VIEW, SET_ROWS) that follows it, in one launch.
+    // The K input must already be computed (its mat-vec comes before this node) and only no-op views may lie between.
+    {
+        static const bool qk_dual = [] { const char * e = getenv("GGML_CUDA_QK_DUAL"); return !e || atoi(e) != 0; }();
+        if (qk_dual && node->op == GGML_OP_RMS_NORM && i + 2 < cgraph->n_nodes &&
+                GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[cuda_ctx->device].cc) && ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA &&
+                ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
+            int j = i + 3;
+            while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+                ++j;
+            }
+            if (j + 4 < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_RMS_NORM &&
+                    ggml_cuda_can_fuse(cgraph, j, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
+                const ggml_tensor * prod = cgraph->nodes[j]->src[0];
+                while (prod && ggml_cuda_is_view_or_noop(prod) && prod->src[0]) {
+                    prod = prod->src[0];
+                }
+                bool computed = false;
+                for (int k = 0; k < i && !computed; ++k) {
+                    computed = cgraph->nodes[k] == prod;
+                }
+                if (computed) {
+                    // the V SET_ROWS that follows (V mat-vec already computed, output read only by that chain) joins the same launch
+                    const ggml_tensor * v_mm = nullptr;
+                    const ggml_tensor * v_sr = nullptr;
+                    static const bool v_join = [] { const char * e = getenv("GGML_CUDA_V_DUAL"); return !e || atoi(e) != 0; }();
+                    if (v_join) {
+                        for (int k = j + 5; k < cgraph->n_nodes && k < j + 16 && !v_sr; ++k) {
+                            const ggml_tensor * c = cgraph->nodes[k];
+                            if (c->op != GGML_OP_SET_ROWS || ggml_cuda_node_skipped(c)) continue;
+                            const ggml_tensor * s = c->src[0];
+                            int depth = 0;
+                            while (s && (s->op == GGML_OP_VIEW || s->op == GGML_OP_RESHAPE) && depth++ < 4) s = s->src[0];
+                            if (!s || s->op != GGML_OP_MUL_MAT) continue;
+                            bool v_done = false;
+                            for (int m = 0; m < i && !v_done; ++m) v_done = cgraph->nodes[m] == s;
+                            if (!v_done) continue;
+                            const ggml_tensor * sr = ggml_cuda_find_v_set_rows(cgraph, k, s, (int) node->ne[2]);
+                            if (sr == c) { v_mm = s; v_sr = c; }
+                        }
+                    }
+                    if (ggml_cuda_op_rms_norm_mul_rope_dual(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
+                            cgraph->nodes[j], cgraph->nodes[j + 1], cgraph->nodes[j + 2], cgraph->nodes[j + 4], v_mm, v_sr)) {
+                        if (v_sr) {
+                            ggml_cuda_mark_node_skipped(v_sr);
+                        }
+                        return j + 4 - i;
+                    }
+                }
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
@@ -5266,7 +5345,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        ggml_tensor * mul_node = cgraph->nodes[i + 1];
+        bool has_mmvq_consumer = false;
+        for (int j = i + 2; j < cgraph->n_nodes && j < i + 8 && !has_mmvq_consumer; ++j) {
+            const ggml_tensor * c = cgraph->nodes[j];
+            has_mmvq_consumer = c->op == GGML_OP_MUL_MAT && c->src[1] == mul_node && c->src[0]->type == GGML_TYPE_Q8_0 ||
+                                c->op == GGML_OP_MUL_MAT && c->src[1] == mul_node && c->src[0]->type == GGML_TYPE_Q4_K ||
+                                c->op == GGML_OP_MUL_MAT && c->src[1] == mul_node && c->src[0]->type == GGML_TYPE_Q6_K;
+        }
+        if (!(has_mmvq_consumer && ggml_cuda_rms_norm_mul_q8_1(*cuda_ctx, node, mul_node))) {
+            ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, mul_node);
+        }
         return 1;
     }
 
@@ -5466,6 +5555,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (ggml_cuda_node_skipped(node)) {
+                    continue;
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -5495,7 +5588,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
-                bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                const bool is_fa = node->op == GGML_OP_FLASH_ATTN_EXT;
+                if (is_fa) {
+                    ggml_cuda_fa_q8_prepare(*cuda_ctx, cgraph, i);
+                }
+                bool ok = (node->op == GGML_OP_GLU && ggml_cuda_glu_q8_1(*cuda_ctx, cgraph, i)) ||
+                          ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (is_fa) {
+                    ggml_cuda_fa_q8_finish(*cuda_ctx);
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -5560,6 +5661,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_qcache_new_epoch();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -5807,6 +5909,66 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     GGML_UNUSED(cuda_ctx);
     GGML_UNUSED(cgraph);
 #endif
+
+    // Pascal: bring the q/k/v Q8_0 mat-vecs next to each other so that they can run as one launch.
+    // Topology depends on op types only (not on the batch size). The nodes are moved before the allocation.
+    static const bool qkv_group = [] { const char * e = getenv("GGML_CUDA_QKV_FUSE"); return !e || atoi(e) != 0; }();
+    if (qkv_group && !disable_fusion && GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+        ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
+        // The kernel fusion itself exists for Q8_0 only; with GGML_CUDA_QKV_REORDER_ALL the K-quant mat-vecs are also brought
+        // together, which lets the Q+K norm/RoPE fusion apply to the target model too.
+        static const bool reorder_all = [] { const char * e = getenv("GGML_CUDA_QKV_REORDER_ALL"); return !e || atoi(e) != 0; }();
+        const auto groupable = [&](ggml_type t) {
+            return t == GGML_TYPE_Q8_0 || (reorder_all && (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q6_K));
+        };
+        for (int i = 0; i + 2 < cgraph->n_nodes; ++i) {
+            const ggml_tensor * a = cgraph->nodes[i];
+            if (a->op != GGML_OP_MUL_MAT || !groupable(a->src[0]->type)) {
+                continue;
+            }
+            const auto same_group = [&](const ggml_tensor * c) {
+                return c->op == GGML_OP_MUL_MAT && c->src[1] == a->src[1] && groupable(c->src[0]->type) && c->src[0]->ne[0] == a->src[0]->ne[0];
+            };
+            int found[2] = { -1, -1 };
+            int nf = 0;
+            for (int j = i + 1; j < cgraph->n_nodes && j < i + 12 && nf < 2; ++j) {
+                if (same_group(cgraph->nodes[j])) {
+                    found[nf++] = j;
+                }
+            }
+            if (nf < 2) {
+                continue;
+            }
+            std::rotate(cgraph->nodes + i + 1, cgraph->nodes + found[0], cgraph->nodes + found[0] + 1);
+            std::rotate(cgraph->nodes + i + 2, cgraph->nodes + found[1], cgraph->nodes + found[1] + 1);
+            i += 2;
+        }
+        // Same for the residual ADD + RMS_NORM + MUL fused into one kernel: the add inputs must stay live until the MUL
+        for (int i = 0; i + 2 < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op == GGML_OP_ADD && cgraph->nodes[i + 1]->op == GGML_OP_RMS_NORM && cgraph->nodes[i + 1]->src[0] == cgraph->nodes[i] &&
+                    cgraph->nodes[i + 2]->op == GGML_OP_MUL) {
+                add_alloc_deps(i, i + 2);
+                i += 2;
+            }
+        }
+
+        // Keep the gate/up inputs alive until the GLU, so the fused mat-vec output cannot alias them
+        // (the memory-range check of the fusion would otherwise disable it, depending on the allocation).
+        for (int i = 0; i + 2 < cgraph->n_nodes; ++i) {
+            const ggml_tensor * glu = cgraph->nodes[i + 2];
+            if (glu->op != GGML_OP_GLU) {
+                continue;
+            }
+            const ggml_tensor * n0 = cgraph->nodes[i];
+            const ggml_tensor * n1 = cgraph->nodes[i + 1];
+            const bool ok = ((glu->src[0] == n0 && glu->src[1] == n1) || (glu->src[0] == n1 && glu->src[1] == n0)) &&
+                            n0->op == GGML_OP_MUL_MAT && n1->op == GGML_OP_MUL_MAT && n0->src[0]->type == GGML_TYPE_Q8_0 && n1->src[0]->type == GGML_TYPE_Q8_0;
+            if (ok) {
+                add_alloc_deps(i, i + 2);
+                i += 2;
+            }
+        }
+    }
 
     static bool enable_graph_optimization = [] {
         const char * env     = getenv("GGML_CUDA_GRAPH_OPT");

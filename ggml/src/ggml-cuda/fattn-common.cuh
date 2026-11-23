@@ -970,13 +970,18 @@ static __global__ void flash_attn_stream_k_fixup_general(
     *dst = dst_val / rowsum;
 }
 
-template<int D> // D == head size
+// Pascal: set by ggml_cuda_fa_q8_prepare, makes the combine kernel also write the Q8_1 copy of its output
+extern block_q8_1 * g_fa_q8_request;
+extern bool         g_fa_q8_done;
+
+template<int D, bool Q8 = false> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_combine_results(
         const float  * VKQ_parts_ptr,
         const float2 * VKQ_meta_ptr,
         float * dst_ptr,
-        const int parallel_blocks) {
+        const int parallel_blocks,
+        block_q8_1 * q8_ptr) {
     ggml_cuda_pdl_lc();
     const float  * GGML_CUDA_RESTRICT VKQ_parts = VKQ_parts_ptr;
     const float2 * GGML_CUDA_RESTRICT VKQ_meta  = VKQ_meta_ptr;
@@ -1025,7 +1030,21 @@ static __global__ void flash_attn_combine_results(
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    const float res = VKQ_numerator / VKQ_denominator;
+    dst[tid] = res;
+
+    if constexpr (Q8) {
+        static_assert(D % QK8_1 == 0, "head size must be a multiple of the Q8_1 block size");
+        const float  amax = warp_reduce_max<QK8_1>(fabsf(res));
+        const float  d    = amax / 127.0f;
+        const int8_t q    = amax == 0.0f ? 0 : roundf(res / d);
+        const int    sum  = warp_reduce_sum<QK8_1>((int) q);
+        block_q8_1 * b    = q8_ptr + (size_t) j_dst_unrolled * (D / QK8_1) + tid / QK8_1;
+        b->qs[tid % QK8_1] = q;
+        if (tid % QK8_1 == 0) {
+            b->ds = make_half2(d, d * sum);
+        }
+    }
 }
 
 template <int DV, int ncols1, int ncols2>
@@ -1276,6 +1295,13 @@ void launch_fattn(
             }
         }
 
+        {
+            static const int pb_cap = [] { const char * e = getenv("GGML_CUDA_FA_PB_CAP"); return e ? atoi(e) : 0; }();
+            if (pb_cap > 0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA) {
+                parallel_blocks = std::min(parallel_blocks, pb_cap);
+            }
+        }
+
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
@@ -1370,8 +1396,19 @@ void launch_fattn(
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
-        ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
-            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+        if constexpr (DV % QK8_1 == 0) {
+            if (g_fa_q8_request) {
+                ggml_cuda_kernel_launch(flash_attn_combine_results<DV, true>, launch_params,
+                    dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, g_fa_q8_request);
+                g_fa_q8_done = true;
+            } else {
+                ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
+                    dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, (block_q8_1 *) nullptr);
+            }
+        } else {
+            ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
+                dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, (block_q8_1 *) nullptr);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }

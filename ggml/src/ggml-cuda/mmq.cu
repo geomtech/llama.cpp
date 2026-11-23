@@ -148,6 +148,17 @@ static int ggml_cuda_mmq_get_J_best(
             continue;
         }
 
+        // Pascal Q4_K: the 128-column tile only pays off for large batches
+        if (J == 128 && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K)) {
+            static const int j128_min = [] {
+                const char * e = getenv("GGML_CUDA_MMQ_J128"); if (e && atoi(e) == 0) return INT_MAX;
+                const char * m = getenv("GGML_CUDA_MMQ_J128_MIN"); return m ? atoi(m) : 256;
+            }();
+            if (ncols < j128_min) {
+                continue;
+            }
+        }
+
         const int ntiles_x = (ncols + config.J - 1) / config.J;
 
         if (ntiles_x < ntiles_J_best) {

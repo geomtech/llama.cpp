@@ -58,7 +58,18 @@ llama_model_qwen3::graph::graph(const llm_graph_params & params) : llm_graph_con
     ggml_tensor * cur = build_backbone();
 
     // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    // Draft-only experiment: LLAMA_DRAFT_VOCAB_LIMIT=N keeps the first N vocabulary rows (a contiguous prefix of the
+    // output matrix) for models with LLAMA_DRAFT_VOCAB_EMBD (default 1024) embeddings. The logits are zero-padded back
+    // to the full vocabulary: the caller must only look at the first N entries (greedy draft argmax).
+    static const int64_t vocab_limit = [] { const char * e = getenv("LLAMA_DRAFT_VOCAB_LIMIT"); return e ? (int64_t) atoll(e) : (int64_t) 0; }();
+    static const int64_t vocab_embd  = [] { const char * e = getenv("LLAMA_DRAFT_VOCAB_EMBD");  return e ? (int64_t) atoll(e) : (int64_t) 1024; }();
+    if (vocab_limit > 0 && vocab_limit < model.output->ne[1] && hparams.n_embd == (uint32_t) vocab_embd) {
+        ggml_tensor * w_pref = ggml_view_2d(ctx0, model.output, model.output->ne[0], vocab_limit, model.output->nb[1], 0);
+        cur = build_lora_mm(w_pref, cur, model.output_s);
+        cur = ggml_pad(ctx0, cur, (int) (model.output->ne[1] - vocab_limit), 0, 0, 0);
+    } else {
+        cur = build_lora_mm(model.output, cur, model.output_s);
+    }
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
